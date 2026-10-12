@@ -1,0 +1,27 @@
+[package]
+name = "photo-picker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.2"
+eframe = "0.35.0"
+filetime = "0.2.29"
+jpeg-decoder = "0.3.2"
+rayon = "1.12.0"
+rfd = "0.17.2"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Decoding is unusably slow unoptimized; optimize dependencies even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = { version = "1.10.1", default-features = false }
+xattr = "1.6.1"

@@ -1,0 +1,4 @@
+# Mac builds are tuned for the CPU of the machine that compiles them (here: Apple M4).
+# Only applies to Apple Silicon builds, so the Windows build is unaffected.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
