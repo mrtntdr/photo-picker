@@ -1,4 +1,9 @@
 # Mac builds are tuned for the CPU of the machine that compiles them (here: Apple M4).
-# Only applies to Apple Silicon builds, so the Windows build is unaffected.
+# Only applies to Apple Silicon builds.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
+
+# Windows builds are tuned the same way for the PC that compiles them (here: Intel i7-8750H,
+# AVX2), and link the C runtime statically so the .exe runs without the VC++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+crt-static"]

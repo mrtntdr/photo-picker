@@ -27,6 +27,10 @@ the window. Subfolders are scanned too (e.g. `DCIM/100MSDCF`).
 To build a double-clickable Mac app with the icon, run `scripts/bundle-mac.sh`; it creates
 `dist/Photo Picker.app`. The icon is drawn by `assets/make_icon.py` (output: `assets/icon.png`).
 
+On Windows, run `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1` to get
+`dist\Photo Picker.exe` with the icon embedded; add `-Shortcut` to also put it in the Start menu.
+The `.ico` is made from `assets/icon.png` by `scripts/make-ico.ps1`.
+
 ## Keys
 
 | Key | Action |
@@ -69,6 +73,9 @@ Safety:
 
 * On Apple Silicon, `.cargo/config.toml` builds for the CPU of the Mac that compiles it
   (`target-cpu=native`). Don't copy that binary to an older Mac; rebuild there instead.
+* On Windows (x86_64) the same applies: the build uses the compiling PC's CPU features (AVX2 etc.)
+  and links the C runtime statically, so the `.exe` needs no VC++ redistributable but may not
+  run on an older CPU. Rebuild on the target PC instead.
 * Previews are decoded at about screen size using JPEG DCT scaling (1/2, 1/4, 1/8). When a
   full-size decode is needed, the faster zune-jpeg decoder is used.
 * Up to 8 worker threads prefetch the next ~6 and previous ~3 photos in the direction you are

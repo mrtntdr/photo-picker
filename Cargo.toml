@@ -25,3 +25,6 @@ opt-level = 3
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = { version = "1.10.1", default-features = false }
 xattr = "1.6.1"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
