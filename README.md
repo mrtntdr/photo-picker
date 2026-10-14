@@ -24,6 +24,12 @@ target\release\photo-picker.exe E:\
 You can also start it without arguments and open a folder with Ctrl/Cmd+O, or drag a folder onto
 the window. Subfolders are scanned too (e.g. `DCIM/100MSDCF`).
 
+Photos are shown in the order they were taken (EXIF DateTimeOriginal; photos without one use the
+file's modification time and are marked "file date" in the info box). Until all dates are read,
+they appear in folder/file name order. The bar under the toolbar has one entry per month with its photo
+count, so you can cull a big year folder month by month; months with nothing left unrated are
+dimmed. The month filter combines with the rating filter (e.g. Unrated in March).
+
 To build a double-clickable Mac app with the icon, run `scripts/bundle-mac.sh`; it creates
 `dist/Photo Picker.app`. The icon is drawn by `assets/make_icon.py` (output: `assets/icon.png`).
 
@@ -44,11 +50,14 @@ The `.ico` is made from `assets/icon.png` by `scripts/make-ico.ps1`.
 | PgDn / PgUp, Home / End | Jump 10, first / last |
 | **Z**, Enter, click | 100% zoom where you clicked (drag to pan) |
 | **F** | Filter: All / Unrated / Shortlist (★3+) / Picked / Rejected |
+| **[** / **]**, Shift+← / Shift+→ | Previous / next month |
+| **M** | All months |
 | **A** | Toggle auto-advance after rating (on by default) |
 | **I** | Toggle photo info (camera, lens, exposure) |
 | H / ? / F1 | Help |
 
-**Copy N picked…** (toolbar) copies every photo rated ★4 or higher to a folder you choose.
+**Copy N picked…** (toolbar) copies every photo rated ★4 or higher to a folder you choose (from
+all months, whatever month is selected).
 Copies keep the rating and the original modification time. Files already at the destination are
 skipped.
 
