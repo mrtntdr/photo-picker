@@ -211,6 +211,7 @@ pub fn scan(generation: u64, root: PathBuf, ctx: egui::Context, tx: Sender<Msg>)
         paths.par_iter().enumerate().for_each_with(tx, |tx, (idx, p)| {
             let mut meta = meta::read_meta_from_file(p).unwrap_or_default();
             meta.thumbnail = None;
+            meta.mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
             let _ = tx.send(Msg::Meta { generation, idx, meta });
             if idx % 32 == 0 {
                 ctx.request_repaint();

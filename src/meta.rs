@@ -11,6 +11,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIF_HEADER: &[u8] = b"Exif\0\0";
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -45,6 +46,79 @@ pub struct Meta {
     pub size: Option<(u32, u32)>,
     /// Embedded EXIF thumbnail (a small JPEG), if present.
     pub thumbnail: Option<Vec<u8>>,
+    /// File modification time, the fallback when there is no EXIF date.
+    pub mtime: Option<SystemTime>,
+}
+
+/// When a photo was taken, for sorting and the month filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureTime {
+    pub year: i32,
+    pub month: u32,
+    /// `YYYYMMDDhhmmss`; sorts chronologically as a string.
+    pub key: String,
+    /// `YYYY-MM-DD hh:mm`, for display.
+    pub label: String,
+    /// From EXIF DateTimeOriginal (true) or the file's modification time (false).
+    pub exif: bool,
+}
+
+/// The EXIF capture date, or else the file's modification time (as UTC).
+pub fn capture_time(meta: &Meta) -> Option<CaptureTime> {
+    if let Some(t) = meta.date.as_deref().and_then(parse_exif_date) {
+        return Some(t);
+    }
+    let secs = meta.mtime?.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    let (y, mo, d) = civil_from_days(secs.div_euclid(86400));
+    let tod = secs.rem_euclid(86400);
+    let (h, mi, s) = (tod / 3600, tod / 60 % 60, tod % 60);
+    Some(CaptureTime {
+        year: y,
+        month: mo,
+        key: format!("{y:04}{mo:02}{d:02}{h:02}{mi:02}{s:02}"),
+        label: format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}"),
+        exif: false,
+    })
+}
+
+/// Parses `YYYY:MM:DD hh:mm:ss`; rejects blank or zeroed dates (`0000:00:00 …`).
+fn parse_exif_date(s: &str) -> Option<CaptureTime> {
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() < 8 {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| digits.get(r).and_then(|v| v.parse::<u32>().ok());
+    let (y, mo, d) = (num(0..4)?, num(4..6)?, num(6..8)?);
+    if y < 1800 || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (h, mi) = (num(8..10).unwrap_or(0), num(10..12).unwrap_or(0));
+    let mut key = digits;
+    key.truncate(14);
+    while key.len() < 14 {
+        key.push('0');
+    }
+    Some(CaptureTime {
+        year: y as i32,
+        month: mo,
+        key,
+        label: format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}"),
+        exif: true,
+    })
+}
+
+/// Days since 1970-01-01 to (year, month, day). From Howard Hinnant's date algorithms.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y as i32, m, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +844,29 @@ mod tests {
         assert_eq!(xmp_find_rating(&xmp_with_rating(Some(elem), 4)), Some(4));
         let none = "<x:xmpmeta><rdf:RDF xmlns:rdf=\"r\"><rdf:Description rdf:about=\"\"/></rdf:RDF></x:xmpmeta>";
         assert_eq!(xmp_find_rating(&xmp_with_rating(Some(none), 4)), Some(4));
+    }
+
+    #[test]
+    fn capture_time_from_exif_or_mtime() {
+        let at = |date: Option<&str>, mtime: Option<u64>| {
+            capture_time(&Meta {
+                date: date.map(String::from),
+                mtime: mtime.map(|s| UNIX_EPOCH + std::time::Duration::from_secs(s)),
+                ..Default::default()
+            })
+        };
+        let t = at(Some("2016:03:04 12:30:45"), None).unwrap();
+        assert_eq!((t.year, t.month, t.key.as_str(), t.exif), (2016, 3, "20160304123045", true));
+        assert_eq!(t.label, "2016-03-04 12:30");
+        // Missing or zeroed EXIF dates fall back to the file time.
+        let jan = 1_452_816_000; // 2016-01-15 00:00:00 UTC
+        for bad in [None, Some(""), Some("0000:00:00 00:00:00"), Some("    :  :     :  :  ")] {
+            let t = at(bad, Some(jan + 3_723)).unwrap();
+            assert_eq!((t.year, t.month, t.key.as_str(), t.exif), (2016, 1, "20160115010203", false));
+        }
+        assert_eq!(at(None, None), None);
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
 }
 

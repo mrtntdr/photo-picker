@@ -27,7 +27,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <dict>
   <key>CFBundleName</key><string>Photo Picker</string>
   <key>CFBundleDisplayName</key><string>Photo Picker</string>
-  <key>CFBundleIdentifier</key><string>com.martinteder.photo-picker</string>
+  <key>CFBundleIdentifier</key><string>app.photo-picker</string>
   <key>CFBundleExecutable</key><string>photo-picker</string>
   <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>

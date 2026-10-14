@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Key as K, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, pos2, vec2,
 };
 
-use crate::meta::Meta;
+use crate::meta::{self, CaptureTime, Meta};
 use crate::workers::{self, Job, Key, Kind, Msg, Scheduler, WriteCmd};
 
 pub const PICK: u8 = 4;
@@ -24,6 +24,15 @@ const AHEAD: usize = 6;
 const BEHIND: usize = 3;
 const THUMB_PX: u32 = 256;
 const STRIP_H: f32 = 96.0;
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Per-month photo counts for the month bar.
+#[derive(Default)]
+struct MonthStats {
+    total: usize,
+    unrated: usize,
+    picked: usize,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
@@ -72,6 +81,8 @@ struct Photo {
     /// `None` until the metadata pass has read it.
     rating: Option<u8>,
     meta: Option<Meta>,
+    /// Capture time, from EXIF or the file's modification time. `None` until read.
+    when: Option<CaptureTime>,
     /// Number of rating writes not yet confirmed.
     pending: u32,
     /// The last rating write failed, so the file doesn't have the shown rating.
@@ -107,7 +118,17 @@ pub struct PickerApp {
     generation: u64,
     root: Option<PathBuf>,
     scanning: bool,
+    /// In scan order; indices into it are stable for the whole session.
     photos: Vec<Photo>,
+    /// Display order: position → photo index. Path order until all dates are read.
+    order: Vec<usize>,
+    /// Photo index → display position.
+    pos_of: Vec<usize>,
+    /// Number of photos whose metadata (and date) has been read.
+    meta_done: usize,
+    /// Month filter: (year, month), or `None` for all.
+    month: Option<(i32, u32)>,
+    /// Photo index.
     cur: usize,
     /// +1 when moving forward, -1 backward (biases prefetching).
     dir: i8,
@@ -117,7 +138,7 @@ pub struct PickerApp {
     thumbs: HashMap<usize, TextureHandle>,
     preview_target: [u32; 2],
     /// Last requested state, to avoid rebuilding the job queue every frame.
-    last_request: Option<(u64, usize, [u32; 2], bool, usize, usize)>,
+    last_request: Option<(u64, usize, [u32; 2], bool, usize, usize, usize)>,
 
     filter: Filter,
     auto_advance: bool,
@@ -154,6 +175,10 @@ impl PickerApp {
             root: None,
             scanning: false,
             photos: Vec::new(),
+            order: Vec::new(),
+            pos_of: Vec::new(),
+            meta_done: 0,
+            month: None,
             cur: 0,
             dir: 1,
             previews: HashMap::new(),
@@ -184,6 +209,10 @@ impl PickerApp {
         self.root = Some(root.clone());
         self.scanning = true;
         self.photos.clear();
+        self.order.clear();
+        self.pos_of.clear();
+        self.meta_done = 0;
+        self.month = None;
         self.previews.clear();
         self.fulls.clear();
         self.thumbs.clear();
@@ -229,11 +258,14 @@ impl PickerApp {
                             path,
                             rating: None,
                             meta: None,
+                            when: None,
                             pending: 0,
                             unsaved: false,
                             error: None,
                         })
                         .collect();
+                    self.order = (0..self.photos.len()).collect();
+                    self.pos_of = self.order.clone();
                     if self.photos.is_empty() {
                         self.set_status("No JPEG files found in this folder");
                     }
@@ -244,7 +276,12 @@ impl PickerApp {
                         if p.pending == 0 && p.rating.is_none() {
                             p.rating = Some(meta.rating.unwrap_or(0));
                         }
+                        p.when = meta::capture_time(&meta);
                         p.meta = Some(meta);
+                        self.meta_done += 1;
+                        if self.meta_done == self.photos.len() {
+                            self.sort_by_date();
+                        }
                     }
                 }
                 Msg::Image { key, target, epoch, result } => {
@@ -315,28 +352,100 @@ impl PickerApp {
     // -----------------------------------------------------------------------
     // Navigation & rating
 
+    /// Once all dates are read: order by capture time (path order breaks ties, no date last).
+    /// The current photo stays current.
+    fn sort_by_date(&mut self) {
+        let photos = &self.photos;
+        self.order.sort_by(|&a, &b| {
+            let key = |i: usize| photos[i].when.as_ref().map(|w| w.key.as_str());
+            let (ka, kb) = (key(a), key(b));
+            ka.is_none().cmp(&kb.is_none()).then(ka.cmp(&kb))
+        });
+        for (pos, &i) in self.order.iter().enumerate() {
+            self.pos_of[i] = pos;
+        }
+        self.last_request = None;
+    }
+
+    fn dates_ready(&self) -> bool {
+        !self.photos.is_empty() && self.meta_done == self.photos.len()
+    }
+
+    fn in_month(&self, i: usize) -> bool {
+        match self.month {
+            None => true,
+            Some((y, m)) => self.photos[i].when.as_ref().is_some_and(|w| w.year == y && w.month == m),
+        }
+    }
+
+    /// Whether photo `i` passes both the rating filter and the month filter.
+    fn shows(&self, i: usize) -> bool {
+        self.filter.matches(self.photos[i].rating) && self.in_month(i)
+    }
+
+    /// Visible photo indices, in display order.
     fn visible_indices(&self) -> Vec<usize> {
-        (0..self.photos.len())
-            .filter(|&i| self.filter.matches(self.photos[i].rating))
-            .collect()
+        self.order.iter().copied().filter(|&i| self.shows(i)).collect()
+    }
+
+    /// Months that have photos, in date order, with their counts.
+    fn months(&self) -> BTreeMap<(i32, u32), MonthStats> {
+        let mut out: BTreeMap<(i32, u32), MonthStats> = BTreeMap::new();
+        for p in &self.photos {
+            let Some(w) = &p.when else { continue };
+            let st = out.entry((w.year, w.month)).or_default();
+            st.total += 1;
+            let r = p.rating.unwrap_or(0);
+            st.unrated += usize::from(r == 0);
+            st.picked += usize::from(r >= PICKED_MIN);
+        }
+        out
+    }
+
+    fn set_month(&mut self, month: Option<(i32, u32)>) {
+        self.month = month;
+        if self.photos.is_empty() {
+            return;
+        }
+        // Land on the first matching photo of the month.
+        if let Some(&i) = self.visible_indices().first() {
+            if month.is_some() || !self.shows(self.cur) {
+                self.go_to(i);
+            }
+        }
+    }
+
+    /// Previous / next month that has photos (`delta` is -1 or 1).
+    fn step_month(&mut self, delta: i32) {
+        if !self.dates_ready() {
+            return;
+        }
+        let months: Vec<(i32, u32)> = self.months().into_keys().collect();
+        let Some(&last) = months.last() else { return };
+        let next = match self.month.and_then(|m| months.iter().position(|&x| x == m)) {
+            None => if delta > 0 { months[0] } else { last },
+            Some(p) => months[(p as i32 + delta).clamp(0, months.len() as i32 - 1) as usize],
+        };
+        self.set_month(Some(next));
     }
 
     fn step(&mut self, delta: isize) {
         if self.photos.is_empty() {
             return;
         }
-        let n = self.photos.len() as isize;
-        let mut i = self.cur as isize;
+        let n = self.order.len() as isize;
+        let mut pos = self.pos_of[self.cur] as isize;
         let mut remaining = delta.abs();
         let s = delta.signum();
         let mut last_ok = self.cur;
         while remaining > 0 {
-            i += s;
-            if i < 0 || i >= n {
+            pos += s;
+            if pos < 0 || pos >= n {
                 break;
             }
-            if self.filter.matches(self.photos[i as usize].rating) {
-                last_ok = i as usize;
+            let i = self.order[pos as usize];
+            if self.shows(i) {
+                last_ok = i;
                 remaining -= 1;
             }
         }
@@ -356,11 +465,12 @@ impl PickerApp {
 
     /// After a filter change, make sure the current photo is visible.
     fn ensure_visible(&mut self) {
-        if self.photos.is_empty() || self.filter.matches(self.photos[self.cur].rating) {
+        if self.photos.is_empty() || self.shows(self.cur) {
             return;
         }
         let vis = self.visible_indices();
-        if let Some(&i) = vis.iter().find(|&&i| i > self.cur).or(vis.last()) {
+        let cur_pos = self.pos_of[self.cur];
+        if let Some(&i) = vis.iter().find(|&&i| self.pos_of[i] > cur_pos).or(vis.last()) {
             self.go_to(i);
         }
     }
@@ -425,7 +535,7 @@ impl PickerApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let (events, cmd) = ctx.input(|i| (i.events.clone(), i.modifiers.command));
         for ev in events {
-            let egui::Event::Key { key, pressed: true, .. } = ev else { continue };
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = ev else { continue };
             if cmd {
                 if key == K::O {
                     self.pick_folder();
@@ -433,6 +543,11 @@ impl PickerApp {
                 continue;
             }
             match key {
+                K::OpenBracket => self.step_month(-1),
+                K::CloseBracket => self.step_month(1),
+                K::ArrowLeft if modifiers.shift => self.step_month(-1),
+                K::ArrowRight if modifiers.shift => self.step_month(1),
+                K::M => self.set_month(None),
                 K::ArrowRight | K::ArrowDown | K::Space => self.step(1),
                 K::ArrowLeft | K::ArrowUp | K::Backspace => self.step(-1),
                 K::PageDown => self.step(10),
@@ -481,28 +596,47 @@ impl PickerApp {
     // -----------------------------------------------------------------------
     // Prefetching
 
+    /// `strip_range` is a range of positions in [`Self::visible_indices`].
     fn request_images(&mut self, strip_range: (usize, usize)) {
         let n = self.photos.len();
         if n == 0 || self.preview_target == [0, 0] {
             return;
         }
-        let state = (self.generation, self.cur, self.preview_target, self.zoom, strip_range.0, strip_range.1);
+        let vis = self.visible_indices();
+        let strip = &vis[strip_range.0.min(vis.len())..strip_range.1.min(vis.len())];
+        let ends = |s: &[usize]| (s.first().copied().unwrap_or(usize::MAX), s.last().copied().unwrap_or(usize::MAX));
+        let (strip_first, strip_last) = ends(strip);
+        let state = (self.generation, self.cur, self.preview_target, self.zoom, strip_first, strip_last, vis.len());
         if self.last_request == Some(state) {
             return;
         }
         self.last_request = Some(state);
 
+        // Neighbours in the visible (filtered, display-ordered) list.
+        let cur_vis = vis.iter().position(|&i| i == self.cur);
+        let near = |d_fwd: usize, d_back: usize| -> Vec<usize> {
+            let mut out = vec![self.cur];
+            let Some(c) = cur_vis else { return out };
+            for d in 1..=d_fwd.max(d_back) {
+                if d <= d_fwd && c + d < vis.len() {
+                    out.push(vis[c + d]);
+                }
+                if d <= d_back && c >= d {
+                    out.push(vis[c - d]);
+                }
+            }
+            out
+        };
         // Order: current, then mostly in the direction of travel.
-        let mut order = vec![self.cur];
         let (fwd, back) = if self.dir >= 0 { (AHEAD, BEHIND) } else { (BEHIND, AHEAD) };
-        for d in 1..=fwd.max(back) {
-            if d <= fwd && self.cur + d < n {
-                order.push(self.cur + d);
-            }
-            if d <= back && self.cur >= d {
-                order.push(self.cur - d);
-            }
-        }
+        let order = near(fwd, back);
+        let keep: HashSet<usize> = near(AHEAD.max(BEHIND) + 2, AHEAD.max(BEHIND) + 2).into_iter().collect();
+        let thumb_keep: HashSet<usize> = vis
+            [strip_range.0.saturating_sub(100).min(vis.len())..(strip_range.1 + 100).min(vis.len())]
+            .iter()
+            .copied()
+            .chain(keep.iter().copied())
+            .collect();
 
         let target = self.preview_target;
         let generation = self.generation;
@@ -528,7 +662,7 @@ impl PickerApp {
                 add(i, Kind::Preview, target, &mut jobs);
             }
         }
-        for i in strip_range.0..strip_range.1.min(n) {
+        for &i in strip {
             if thumb_missing(i) {
                 add(i, Kind::Thumb, [THUMB_PX, THUMB_PX], &mut jobs);
             }
@@ -537,11 +671,10 @@ impl PickerApp {
         self.sched.set_jobs(jobs);
 
         // Evict textures far from the current position.
-        let (cur, keep_lo, keep_hi) = (self.cur, BEHIND.max(AHEAD) + 2, AHEAD.max(BEHIND) + 2);
-        self.previews.retain(|&i, _| i + keep_lo >= cur && i <= cur + keep_hi);
+        let cur = self.cur;
+        self.previews.retain(|i, _| keep.contains(i));
         self.fulls.retain(|&i, _| i == cur);
-        let (lo, hi) = (strip_range.0.saturating_sub(100), strip_range.1 + 100);
-        self.thumbs.retain(|&i, _| (i >= lo && i < hi) || i.abs_diff(cur) <= keep_hi);
+        self.thumbs.retain(|i, _| thumb_keep.contains(i));
     }
 
     // -----------------------------------------------------------------------
@@ -600,15 +733,22 @@ impl PickerApp {
                 }
                 divider(ui);
                 if !self.photos.is_empty() {
-                    let rejected = self.photos.iter().filter(|p| p.rating == Some(REJECT)).count();
-                    let unrated = self.photos.iter().filter(|p| p.rating.unwrap_or(0) == 0).count();
-                    let shortlisted = self.photos.iter().filter(|p| p.rating == Some(SHORTLIST)).count();
+                    // Counts follow the month filter (but not the rating filter).
+                    let ratings: Vec<u8> = (0..self.photos.len())
+                        .filter(|&i| self.in_month(i))
+                        .map(|i| self.photos[i].rating.unwrap_or(0))
+                        .collect();
+                    let count = |f: fn(u8) -> bool| ratings.iter().filter(|&&r| f(r)).count();
+                    let photos_label = match self.month {
+                        Some(m) => format!("photos in {}", month_name(m)),
+                        None => "photos".to_string(),
+                    };
                     for (n, label) in [
-                        (unrated, "unrated"),
-                        (rejected, "rejected"),
-                        (shortlisted, "shortlisted"),
-                        (picked, "picked"),
-                        (self.photos.len(), "photos"),
+                        (count(|r| r == 0), "unrated"),
+                        (count(|r| r == REJECT), "rejected"),
+                        (count(|r| r == SHORTLIST), "shortlisted"),
+                        (count(|r| r >= PICKED_MIN), "picked"),
+                        (ratings.len(), photos_label.as_str()),
                     ] {
                         ui.label(egui::RichText::new(label).color(MUTED));
                         ui.label(egui::RichText::new(n.to_string()).color(BRIGHT));
@@ -622,7 +762,41 @@ impl PickerApp {
         });
     }
 
-    /// Draws the filmstrip, returns the range of indices it shows.
+    /// One chip per month that has photos; months with nothing left to rate are dimmed.
+    fn month_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            if !self.dates_ready() {
+                ui.spinner();
+                ui.label(egui::RichText::new(format!("Reading dates… {}/{}", self.meta_done, self.photos.len())).color(MUTED));
+                return;
+            }
+            let months = self.months();
+            let multi_year = months.keys().next().map(|k| k.0) != months.keys().next_back().map(|k| k.0);
+            let mut chosen = None;
+            if ui.selectable_label(self.month.is_none(), "All months").on_hover_text("Show all months (M)").clicked() {
+                chosen = Some(None);
+            }
+            divider(ui);
+            for (&(y, m), st) in &months {
+                let name = MONTHS[(m - 1) as usize];
+                let label = if multi_year { format!("{name} ’{:02} ", y.rem_euclid(100)) } else { format!("{name} ") };
+                let mut text = egui::text::LayoutJob::default();
+                let done = st.unrated == 0;
+                let fmt = |color| egui::TextFormat { color, font_id: FontId::proportional(13.0), ..Default::default() };
+                text.append(&label, 0.0, fmt(if done { FAINT } else { TEXT }));
+                text.append(&st.total.to_string(), 0.0, fmt(if done { FAINT } else { MUTED }));
+                let hover = format!("{} unrated · {} picked   ([ / ] previous / next month)", st.unrated, st.picked);
+                if ui.selectable_label(self.month == Some((y, m)), text).on_hover_text(hover).clicked() {
+                    chosen = Some(Some((y, m)));
+                }
+            }
+            if let Some(m) = chosen {
+                self.set_month(m);
+            }
+        });
+    }
+
+    /// Draws the filmstrip, returns the range of visible positions it shows (plus a margin).
     fn filmstrip(&mut self, ui: &mut egui::Ui) -> (usize, usize) {
         let rect = ui.available_rect_before_wrap();
         let vis = self.visible_indices();
@@ -675,10 +849,10 @@ impl PickerApp {
             }
         }
         if let Some(i) = clicked {
-            self.dir = if i >= self.cur { 1 } else { -1 };
+            self.dir = if self.pos_of[i] >= self.pos_of[self.cur] { 1 } else { -1 };
             self.go_to(i);
         }
-        (shown[0].saturating_sub(4), shown[shown.len() - 1] + 5)
+        (first.saturating_sub(4), (first + shown.len() + 5).min(vis.len()))
     }
 
     fn main_view(&mut self, ui: &mut egui::Ui) {
@@ -709,11 +883,15 @@ impl PickerApp {
             painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(15.0), MUTED);
             return;
         }
-        if !self.filter.matches(self.photos[self.cur].rating) {
+        if !self.shows(self.cur) {
+            let msg = match self.month {
+                Some(m) => format!("No photos match “{}” in {} (press F or M to change)", self.filter.label(), month_name(m)),
+                None => format!("No photos match “{}” (press F to change)", self.filter.label()),
+            };
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                format!("No photos match “{}” (press F to change)", self.filter.label()),
+                msg,
                 FontId::proportional(15.0),
                 MUTED,
             );
@@ -802,7 +980,9 @@ impl PickerApp {
         painter.galley(bpos, galley, Color32::WHITE);
 
         if self.show_info {
-            let mut lines = vec![format!("{}   ({}/{})", p.name, self.cur + 1, self.photos.len())];
+            let vis = self.visible_indices();
+            let k = vis.iter().position(|&i| i == self.cur).map_or(0, |k| k + 1);
+            let mut lines = vec![format!("{}   ({k}/{})", p.name, vis.len())];
             if let Some(m) = &p.meta {
                 let exposure: Vec<String> = [
                     m.focal.clone(),
@@ -820,9 +1000,11 @@ impl PickerApp {
                 if !gear.is_empty() {
                     lines.push(gear.join(" · "));
                 }
-                if let Some(d) = &m.date {
-                    lines.push(d.clone());
-                }
+            }
+            match &p.when {
+                Some(w) if w.exif => lines.push(w.label.clone()),
+                Some(w) => lines.push(format!("{}  (file date, no EXIF date)", w.label)),
+                None => {}
             }
             if p.pending > 0 {
                 lines.push("saving rating…".into());
@@ -932,6 +1114,8 @@ impl PickerApp {
                         ("Home / End", "First / last"),
                         ("Z  Enter  click", "Toggle 100% zoom (drag to pan)"),
                         ("F", "Cycle filter: All / Unrated / Shortlist / Picked / Rejected"),
+                        ("[  ]   Shift+←  Shift+→", "Previous / next month"),
+                        ("M", "All months"),
                         ("A", "Toggle auto-advance after rating"),
                         ("I", "Toggle photo info"),
                         ("Ctrl/Cmd + O", "Open folder"),
@@ -981,6 +1165,14 @@ impl eframe::App for PickerApp {
             .show(ui, |ui| {
                 self.top_bar(ui);
             });
+        if !self.photos.is_empty() {
+            egui::Panel::top("months")
+                .exact_size(34.0)
+                .frame(egui::Frame::NONE.fill(CANVAS).inner_margin(egui::Margin::symmetric(12, 0)))
+                .show(ui, |ui| {
+                    self.month_bar(ui);
+                });
+        }
         if let Some((s, t)) = &self.status {
             if t.elapsed() < Duration::from_secs(8) {
                 let s = s.clone();
@@ -1052,6 +1244,11 @@ const FAINT: Color32 = Color32::from_gray(85);
 const MUTED: Color32 = Color32::from_gray(125);
 const TEXT: Color32 = Color32::from_gray(200);
 const BRIGHT: Color32 = Color32::from_gray(245);
+
+/// "Mar 2016".
+fn month_name((y, m): (i32, u32)) -> String {
+    format!("{} {y}", MONTHS[(m - 1) as usize])
+}
 
 /// Thin vertical rule between toolbar groups.
 fn divider(ui: &mut egui::Ui) {
