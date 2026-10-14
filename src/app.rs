@@ -130,6 +130,9 @@ pub struct PickerApp {
     copy_progress: Option<(usize, usize)>,
     /// The window was hidden (minimized, occluded) on the previous frame.
     was_hidden: bool,
+    /// Maximize once the window is first shown. Asking for it at window creation leaves
+    /// Windows in a half-maximized state, because eframe creates the window hidden.
+    maximize_pending: bool,
     snacks: Vec<Snack>,
     /// Where the photo is drawn, for placing error notices over it.
     view_rect: Rect,
@@ -170,6 +173,7 @@ impl PickerApp {
             status: None,
             copy_progress: None,
             was_hidden: false,
+            maximize_pending: true,
             snacks: Vec::new(),
             view_rect: Rect::NOTHING,
         };
@@ -957,6 +961,16 @@ impl eframe::App for PickerApp {
             self.sched.hidden_epoch.fetch_add(1, Ordering::SeqCst);
         }
         self.was_hidden = hidden;
+
+        // eframe shows the window after painting the first frame, so maximize on the next one.
+        if self.maximize_pending {
+            if ctx.cumulative_frame_nr() >= 1 {
+                self.maximize_pending = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            } else {
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1010,7 +1024,7 @@ impl eframe::App for PickerApp {
         self.request_images(strip_range);
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Let pending rating writes finish before quitting.
         self.write_tx = None;
         if let Some(w) = self.writer.take() {
