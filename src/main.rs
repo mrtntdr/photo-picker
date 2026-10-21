@@ -3,6 +3,7 @@
 
 mod app;
 mod decode;
+mod heic;
 #[cfg(target_os = "macos")]
 mod mac_tags;
 mod meta;

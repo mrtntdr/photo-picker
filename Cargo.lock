@@ -2410,6 +2410,7 @@ dependencies = [
  "plist",
  "rayon",
  "rfd",
+ "windows",
  "winresource",
  "xattr",
  "zune-core",

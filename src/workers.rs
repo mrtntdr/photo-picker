@@ -11,6 +11,7 @@ use std::{fs, thread};
 use eframe::egui::{self, TextureHandle, TextureOptions};
 
 use crate::decode::{decode_jpeg, decode_jpeg_full};
+use crate::heic;
 use crate::meta::{self, Meta};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -127,7 +128,15 @@ impl Scheduler {
 fn run_job(ctx: &egui::Context, job: &Job) -> Result<TextureHandle, String> {
     let [w, h] = job.target;
     let max_side = ctx.input(|i| i.max_texture_side) as u32;
-    let image = match job.key.kind {
+    let image = if heic::is_heic(&job.path) {
+        let m = meta::read_meta_from_file(&job.path).map_err(|e| e.to_string())?;
+        match job.key.kind {
+            Kind::Thumb => heic::decode(&job.path, &m, true, w, h, max_side)?,
+            Kind::Preview => heic::decode(&job.path, &m, false, w, h, max_side)?,
+            Kind::Full => heic::decode(&job.path, &m, false, u32::MAX, u32::MAX, max_side)?,
+        }
+    } else {
+        match job.key.kind {
         Kind::Thumb => {
             // Prefer the embedded EXIF thumbnail: only the header is read.
             let m = meta::read_meta_from_file(&job.path).map_err(|e| e.to_string())?;
@@ -153,6 +162,7 @@ fn run_job(ctx: &egui::Context, job: &Job) -> Result<TextureHandle, String> {
             let m = meta::read_meta_from_bytes(&data);
             decode_jpeg_full(&data, m.orientation, max_side)?
         }
+        }
     };
     let options = TextureOptions {
         mipmap_mode: (job.key.kind != Kind::Full).then_some(egui::TextureFilter::Linear),
@@ -165,7 +175,8 @@ fn run_job(ctx: &egui::Context, job: &Job) -> Result<TextureHandle, String> {
 // ---------------------------------------------------------------------------
 // Folder scan
 
-pub fn is_jpeg(p: &Path) -> bool {
+/// JPEG or HEIC.
+pub fn is_photo(p: &Path) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
     // Skip macOS "._" AppleDouble files that litter SD cards.
     if name.starts_with('.') {
@@ -173,7 +184,7 @@ pub fn is_jpeg(p: &Path) -> bool {
     }
     matches!(
         p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg")
+        Some("jpg" | "jpeg" | "heic" | "heif" | "hif")
     )
 }
 
@@ -188,13 +199,13 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             .is_some_and(|n| n.starts_with('.') || n.starts_with('$'));
         if ft.is_dir() && !hidden && depth < 8 {
             collect(&p, out, depth + 1);
-        } else if ft.is_file() && is_jpeg(&p) {
+        } else if ft.is_file() && is_photo(&p) {
             out.push(p);
         }
     }
 }
 
-/// Recursively finds JPEGs, then reads their metadata in parallel.
+/// Recursively finds photos, then reads their metadata in parallel.
 pub fn scan(generation: u64, root: PathBuf, ctx: egui::Context, tx: Sender<Msg>) {
     thread::spawn(move || {
         let mut paths = Vec::new();
@@ -263,7 +274,8 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 pub enum WriteCmd {
     Rate { generation: u64, idx: usize, path: PathBuf, rating: u8 },
-    Copy { files: Vec<PathBuf>, dest: PathBuf },
+    /// Each file with an optional subfolder of `dest` (e.g. "2016-03").
+    Copy { files: Vec<(PathBuf, Option<String>)>, dest: PathBuf },
 }
 
 pub fn start_writer(ctx: egui::Context, tx: Sender<Msg>, rx: Receiver<WriteCmd>) -> thread::JoinHandle<()> {
@@ -299,45 +311,103 @@ pub fn start_writer(ctx: egui::Context, tx: Sender<Msg>, rx: Receiver<WriteCmd>)
         .expect("spawn writer thread")
 }
 
-fn copy_files(files: &[PathBuf], dest: &Path, ctx: &egui::Context, tx: &Sender<Msg>) {
+/// Same size and modification time (copies keep it; FAT/SMB may round to 2 s).
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    let secs = |m: &fs::Metadata| filetime::FileTime::from_last_modification_time(m).unix_seconds();
+    a.len() == b.len() && secs(a).abs_diff(secs(b)) <= 2
+}
+
+fn copy_files(files: &[(PathBuf, Option<String>)], dest: &Path, ctx: &egui::Context, tx: &Sender<Msg>) {
     let (mut copied, mut skipped, mut errors) = (0, 0, Vec::new());
-    for (i, src) in files.iter().enumerate() {
+    for (i, (src, sub)) in files.iter().enumerate() {
         let _ = tx.send(Msg::CopyProgress { done: i, total: files.len() });
         ctx.request_repaint();
         let Some(name) = src.file_name() else { continue };
-        let src_len = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-        let mut target = dest.join(name);
-        let mut n = 1;
-        let mut skip = false;
-        while let Ok(m) = fs::metadata(&target) {
-            if m.len() == src_len {
-                skip = true; // Already copied.
-                break;
+        let dir = match sub {
+            Some(sub) => dest.join(sub),
+            None => dest.to_path_buf(),
+        };
+        let res = (|| -> std::io::Result<bool> {
+            fs::create_dir_all(&dir)?;
+            let src_md = fs::metadata(src)?;
+            // iPhones reuse names like IMG_1234.HEIC, so a name match alone isn't a duplicate.
+            let mut target = dir.join(name);
+            let mut n = 1;
+            let mut already = false;
+            while let Ok(m) = fs::metadata(&target) {
+                if same_file(&m, &src_md) {
+                    already = true;
+                    break;
+                }
+                let stem = Path::new(name).file_stem().unwrap_or_default().to_string_lossy();
+                let ext = Path::new(name).extension().unwrap_or_default().to_string_lossy();
+                target = dir.join(format!("{stem}_{n}.{ext}"));
+                n += 1;
             }
-            let stem = Path::new(name).file_stem().unwrap_or_default().to_string_lossy();
-            let ext = Path::new(name).extension().unwrap_or_default().to_string_lossy();
-            target = dest.join(format!("{stem}_{n}.{ext}"));
-            n += 1;
-        }
-        if skip {
-            skipped += 1;
-            continue;
-        }
-        let tmp = dest.join(format!(".{}.picker-tmp", name.to_string_lossy()));
-        let res = fs::copy(src, &tmp).and_then(|_| {
-            if let Ok(md) = fs::metadata(src) {
-                let _ = filetime::set_file_mtime(&tmp, filetime::FileTime::from_last_modification_time(&md));
+            if !already {
+                let tmp = dir.join(format!(".{}.picker-tmp", name.to_string_lossy()));
+                let res = fs::copy(src, &tmp).and_then(|_| {
+                    let _ = filetime::set_file_mtime(&tmp, filetime::FileTime::from_last_modification_time(&src_md));
+                    fs::rename(&tmp, &target)
+                });
+                if let Err(e) = res {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
             }
-            fs::rename(&tmp, &target)
-        });
+            // The rating sidecar travels with the photo (and is refreshed if it changed).
+            let side = meta::sidecar_path(src);
+            if side.exists() {
+                fs::copy(&side, meta::sidecar_path(&target))?;
+            }
+            Ok(already)
+        })();
         match res {
-            Ok(()) => copied += 1,
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                errors.push(format!("{}: {e}", src.display()));
-            }
+            Ok(true) => skipped += 1,
+            Ok(false) => copied += 1,
+            Err(e) => errors.push(format!("{}: {e}", src.display())),
         }
     }
     let _ = tx.send(Msg::CopyDone { copied, skipped, errors, dest: dest.to_path_buf() });
     ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_keeps_same_named_photos_apart_and_brings_sidecars() {
+        let dir = std::env::temp_dir().join(format!("picker-copy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (a, b, dest) = (dir.join("a"), dir.join("b"), dir.join("dest"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        // Two different photos with the same name and size, from different folders.
+        fs::write(a.join("IMG_1.HEIC"), b"aaaa").unwrap();
+        fs::write(b.join("IMG_1.HEIC"), b"bbbb").unwrap();
+        filetime::set_file_mtime(b.join("IMG_1.HEIC"), filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+        fs::write(meta::sidecar_path(&a.join("IMG_1.HEIC")), "rating").unwrap();
+        let files = vec![(a.join("IMG_1.HEIC"), Some("2016-03".to_string())), (b.join("IMG_1.HEIC"), Some("2016-03".to_string()))];
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        copy_files(&files, &dest, &ctx, &tx);
+        let month = dest.join("2016-03");
+        assert_eq!(fs::read(month.join("IMG_1.HEIC")).unwrap(), b"aaaa");
+        assert_eq!(fs::read(month.join("IMG_1_1.HEIC")).unwrap(), b"bbbb");
+        assert_eq!(fs::read_to_string(month.join("IMG_1.HEIC.xmp")).unwrap(), "rating");
+
+        // Copying again finds both already there.
+        copy_files(&files, &dest, &ctx, &tx);
+        let done: Vec<(usize, usize)> = rx
+            .try_iter()
+            .filter_map(|m| match m {
+                Msg::CopyDone { copied, skipped, .. } => Some((copied, skipped)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, [(2, 0), (0, 2)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
