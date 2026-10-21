@@ -9,9 +9,11 @@ pub const PICKED_TAG: &str = "Picked";
 const TAGS_ATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 
 /// Copies all extended attributes from `from` to `to`, adding or removing the
-/// "Picked" tag. Other tags the user set are kept.
+/// "Picked" tag. Other tags the user set are kept. `from` and `to` may be the
+/// same file, to just update the tag.
 pub fn carry_over(from: &Path, to: &Path, picked: bool) -> io::Result<()> {
-    for name in xattr::list(from)? {
+    let in_place = from == to;
+    for name in xattr::list(from)?.filter(|_| !in_place) {
         if name == TAGS_ATTR {
             continue;
         }
@@ -42,6 +44,9 @@ pub fn carry_over(from: &Path, to: &Path, picked: bool) -> io::Result<()> {
     }
 
     if tags.is_empty() {
+        if in_place && old.is_some() {
+            xattr::remove(to, TAGS_ATTR)?;
+        }
         return Ok(());
     }
     let mut buf = Vec::new();
@@ -86,6 +91,18 @@ mod tests {
         carry_over(&b, &c, false).unwrap();
         let tags = parse_tags(&xattr::get(&c, TAGS_ATTR).unwrap().unwrap()).unwrap();
         assert_eq!(tags, ["Red\n6"]);
+
+        // In place: the tag is added and removed again on the same file.
+        carry_over(&c, &c, true).unwrap();
+        carry_over(&c, &c, false).unwrap();
+        let tags = parse_tags(&xattr::get(&c, TAGS_ATTR).unwrap().unwrap()).unwrap();
+        assert_eq!(tags, ["Red\n6"]);
+        fs::write(&a, b"x").unwrap();
+        let fresh = dir.join("d");
+        fs::write(&fresh, b"x").unwrap();
+        carry_over(&fresh, &fresh, true).unwrap();
+        carry_over(&fresh, &fresh, false).unwrap();
+        assert_eq!(xattr::get(&fresh, TAGS_ATTR).unwrap(), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -10,11 +10,11 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const EXIF_HEADER: &[u8] = b"Exif\0\0";
-const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+pub(crate) const EXIF_HEADER: &[u8] = b"Exif\0\0";
+pub(crate) const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
 const TAG_ORIENTATION: u16 = 0x0112;
 const TAG_MAKE: u16 = 0x010F;
@@ -233,6 +233,9 @@ fn with_dims(mut meta: Meta, dims: Option<(u32, u32)>) -> Meta {
 }
 
 pub fn read_meta_from_file(path: &Path) -> io::Result<Meta> {
+    if crate::heic::is_heic(path) {
+        return crate::heic::read_meta(path);
+    }
     let (app1, dims) = read_header(path)?;
     Ok(with_dims(parse_app1s(app1.iter().map(|v| v.as_slice())), dims))
 }
@@ -255,7 +258,7 @@ pub fn read_meta_from_bytes(buf: &[u8]) -> Meta {
     }
 }
 
-fn parse_app1s<'a>(app1s: impl Iterator<Item = &'a [u8]>) -> Meta {
+pub(crate) fn parse_app1s<'a>(app1s: impl Iterator<Item = &'a [u8]>) -> Meta {
     let mut meta = Meta {
         orientation: 1,
         ..Default::default()
@@ -724,6 +727,9 @@ pub fn jpeg_with_rating(buf: &[u8], rating: u8) -> io::Result<Vec<u8>> {
 /// keeping the file's modification time (and, on macOS, its extended
 /// attributes, with a "Picked" Finder tag on picked photos).
 pub fn write_rating(path: &Path, rating: u8) -> io::Result<()> {
+    if crate::heic::is_heic(path) {
+        return write_sidecar_rating(path, rating);
+    }
     let buf = fs::read(path)?;
     let new = jpeg_with_rating(&buf, rating)?;
 
@@ -763,6 +769,52 @@ pub fn write_rating(path: &Path, rating: u8) -> io::Result<()> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// XMP sidecars (for HEIC, which is never modified)
+
+/// `IMG_1234.HEIC` → `IMG_1234.HEIC.xmp` (the darktable/digiKam naming; unlike
+/// `IMG_1234.xmp` it can't collide with a JPEG or a Live Photo's video of the same name).
+pub fn sidecar_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".xmp");
+    path.with_file_name(name)
+}
+
+pub fn read_sidecar_rating(path: &Path) -> Option<u8> {
+    xmp_find_rating(&fs::read_to_string(sidecar_path(path)).ok()?)
+}
+
+/// Sets the rating in the photo's sidecar, keeping anything else already in it.
+fn write_sidecar_rating(path: &Path, rating: u8) -> io::Result<()> {
+    let side = sidecar_path(path);
+    let old = match fs::read_to_string(&side) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let new = xmp_with_rating(old.as_deref(), rating);
+    if xmp_find_rating(&new) != Some(rating.min(5)) {
+        return Err(invalid("rating verification failed; sidecar left unchanged"));
+    }
+    let name = side.file_name().and_then(|n| n.to_str()).unwrap_or("photo.xmp");
+    let tmp = side.with_file_name(format!(".{name}.picker-tmp"));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(new.as_bytes())?;
+        f.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, &side) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // The Finder tag goes on the photo itself (an extended attribute, the file is unchanged).
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::mac_tags::carry_over(path, path, rating >= crate::app::PICKED_MIN) {
+        return Err(io::Error::new(e.kind(), format!("Finder tags: {e}")));
+    }
+    Ok(())
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -847,6 +899,26 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_rating_roundtrip_keeps_other_xmp() {
+        let dir = std::env::temp_dir().join(format!("picker-sidecar-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("IMG_1.HEIC");
+        fs::write(&photo, b"photo").unwrap();
+        assert_eq!(read_sidecar_rating(&photo), None);
+        write_rating(&photo, 4).unwrap();
+        assert_eq!(read_sidecar_rating(&photo), Some(4));
+        assert_eq!(read_meta_from_file(&photo).ok().and_then(|m| m.rating), None, "not a real HEIC");
+        // Another program's sidecar content is kept.
+        let other = "<x:xmpmeta><rdf:RDF><rdf:Description dc:title=\"Beach\" xmp:Rating=\"2\"/></rdf:RDF></x:xmpmeta>";
+        fs::write(sidecar_path(&photo), other).unwrap();
+        write_rating(&photo, 1).unwrap();
+        let s = fs::read_to_string(sidecar_path(&photo)).unwrap();
+        assert!(s.contains("dc:title=\"Beach\"") && s.contains("xmp:Rating=\"1\""), "{s}");
+        assert_eq!(fs::read(&photo).unwrap(), b"photo", "the photo itself is never touched");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn capture_time_from_exif_or_mtime() {
         let at = |date: Option<&str>, mtime: Option<u64>| {
             capture_time(&Meta {
@@ -879,7 +951,7 @@ fn real_files_roundtrip() {
     let Ok(dir) = std::env::var("PICKER_TEST_DIR") else { return };
     for entry in fs::read_dir(dir).unwrap().flatten() {
         let path = entry.path();
-        if !crate::workers::is_jpeg(&path) {
+        if !crate::workers::is_photo(&path) || crate::heic::is_heic(&path) {
             continue;
         }
         let orig = fs::read(&path).unwrap();

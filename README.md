@@ -1,7 +1,7 @@
 # Photo Picker
 
-A fast photo culling app for JPEGs straight off an SD card. It runs natively on macOS (Apple Silicon)
-and Windows 11 from the same code.
+A fast photo culling app for JPEGs straight off an SD card, and for iPhone HEIC photos. It runs
+natively on macOS (Apple Silicon) and Windows 11 from the same code.
 
 Cull in two passes if you like: press **S** to shortlist photos that are roughly good (★★★, 3 stars),
 then use the Shortlist filter and press **P** to pick the best (★★★★, 4 stars). **X** rejects
@@ -57,11 +57,26 @@ The `.ico` is made from `assets/icon.png` by `scripts/make-ico.ps1`.
 | H / ? / F1 | Help |
 
 **Copy N picked…** (toolbar) copies every photo rated ★4 or higher to a folder you choose (from
-all months, whatever month is selected).
-Copies keep the rating and the original modification time. Files already at the destination are
-skipped.
+all months, whatever month is selected), either into that one folder or into month subfolders
+(`2016-03`, `2016-04`, …). Copies keep the rating (HEIC sidecars are copied along) and the original
+modification time. A file that is already at the destination (same name, size and modification
+time) is skipped; a different photo with the same name, as iPhones reuse `IMG_1234`, is copied as
+`IMG_1234_1.HEIC`.
+
+## HEIC (iPhone photos)
+
+HEIC files are shown, sorted by date and rated like JPEGs, but **never modified**: the rating goes to
+a small sidecar file next to the photo, `IMG_1234.HEIC.xmp` (standard XMP `xmp:Rating`, the naming
+darktable and digiKam use), so the app remembers it between sessions.
+
+Decoding uses the operating system:
+* **Windows 11:** needs "HEIF Image Extensions" and "HEVC Video Extensions" from the Microsoft
+  Store. If the Photos app opens iPhone photos, both are installed. Otherwise the app says so.
+* **macOS:** built in.
 
 ## What gets written
+
+For JPEG:
 
 * EXIF IFD0 `Rating` (0x4746) and `RatingPercent` (0x4749): the Windows convention
   (1→1, 2→25, 3→50, 4→75, 5→99).

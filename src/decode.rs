@@ -71,7 +71,7 @@ pub fn decode_jpeg(
 }
 
 /// Applies an EXIF orientation (1..=8) to a row-major pixel buffer.
-fn orient(src: Vec<Color32>, w: usize, h: usize, o: u8) -> ColorImage {
+pub(crate) fn orient(src: Vec<Color32>, w: usize, h: usize, o: u8) -> ColorImage {
     if o <= 1 || o > 8 {
         return ColorImage::new([w, h], src);
     }

@@ -267,7 +267,7 @@ impl PickerApp {
                     self.order = (0..self.photos.len()).collect();
                     self.pos_of = self.order.clone();
                     if self.photos.is_empty() {
-                        self.set_status("No JPEG files found in this folder");
+                        self.set_status("No JPEG or HEIC photos found in this folder");
                     }
                 }
                 Msg::Meta { generation, idx, meta } if generation == self.generation => {
@@ -509,12 +509,20 @@ impl PickerApp {
         self.rate(if shortlisted { REJECT } else { SHORTLIST });
     }
 
-    fn copy_picked(&mut self) {
-        let files: Vec<PathBuf> = self
-            .photos
+    /// Copies all picks (from every month), optionally into "YYYY-MM" subfolders.
+    fn copy_picked(&mut self, by_month: bool) {
+        let files: Vec<(PathBuf, Option<String>)> = self
+            .order
             .iter()
+            .map(|&i| &self.photos[i])
             .filter(|p| p.rating.unwrap_or(0) >= PICKED_MIN)
-            .map(|p| p.path.clone())
+            .map(|p| {
+                let sub = by_month.then(|| match &p.when {
+                    Some(w) => format!("{:04}-{:02}", w.year, w.month),
+                    None => "no date".to_string(),
+                });
+                (p.path.clone(), sub)
+            })
             .collect();
         if files.is_empty() {
             self.set_status("Nothing picked yet — press P to pick a photo");
@@ -686,12 +694,21 @@ impl PickerApp {
                 self.pick_folder();
             }
             let picked = self.photos.iter().filter(|p| p.rating.unwrap_or(0) >= PICKED_MIN).count();
-            let copy_btn = ui.add_enabled(
-                picked > 0 && self.copy_progress.is_none(),
-                egui::Button::new(format!("Copy {picked} picked")),
-            );
-            if copy_btn.on_hover_text("Copy all photos rated ★4 or more to a folder").clicked() {
-                self.copy_picked();
+            let mut copy = None;
+            ui.add_enabled_ui(picked > 0 && self.copy_progress.is_none(), |ui| {
+                ui.menu_button(format!("Copy {picked} picked"), |ui| {
+                    if ui.button("Into one folder…").clicked() {
+                        copy = Some(false);
+                    }
+                    if ui.button("Into month folders (2016-03, …)…").clicked() {
+                        copy = Some(true);
+                    }
+                })
+                .response
+                .on_hover_text("Copy all photos rated ★4 or more (from every month) to a folder");
+            });
+            if let Some(by_month) = copy {
+                self.copy_picked(by_month);
             }
             divider(ui);
             for f in [Filter::All, Filter::Unrated, Filter::Shortlist, Filter::Picked, Filter::Rejected] {
@@ -876,7 +893,7 @@ impl PickerApp {
             let msg = if self.scanning {
                 "Scanning for photos…"
             } else if self.root.is_some() {
-                "No JPEG photos here. Open another folder with Ctrl/Cmd+O."
+                "No JPEG or HEIC photos here. Open another folder with Ctrl/Cmd+O."
             } else {
                 "Open a folder (Ctrl/Cmd+O) or drop one on this window to start picking."
             };
@@ -1127,7 +1144,7 @@ impl PickerApp {
                     }
                 });
                 ui.add_space(12.0);
-                ui.small("Ratings are written to the JPEG immediately (EXIF Rating + XMP xmp:Rating),\nso Lightroom, Bridge, Windows Explorer and others see them.\nOn macOS, picked photos also get a \"Picked\" Finder tag.");
+                ui.small("Ratings are written to the JPEG immediately (EXIF Rating + XMP xmp:Rating),\nso Lightroom, Bridge, Windows Explorer and others see them.\nHEIC photos are never changed: their rating goes to a small IMG_1234.HEIC.xmp file next to them.\nOn macOS, picked photos also get a \"Picked\" Finder tag.");
             });
         self.show_help = open;
     }

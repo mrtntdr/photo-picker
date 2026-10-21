@@ -26,5 +26,9 @@ opt-level = 3
 plist = { version = "1.10.1", default-features = false }
 xattr = "1.6.1"
 
+[target.'cfg(windows)'.dependencies]
+# Already used by eframe; WIC decodes HEIC with the Microsoft Store HEIF/HEVC extensions.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com"] }
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = { version = "0.1", default-features = false }
