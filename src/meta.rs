@@ -13,6 +13,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::keywords;
+
 pub(crate) const EXIF_HEADER: &[u8] = b"Exif\0\0";
 pub(crate) const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
@@ -35,6 +37,8 @@ const TAG_THUMB_LENGTH: u16 = 0x0202;
 pub struct Meta {
     pub orientation: u8,
     pub rating: Option<u8>,
+    /// XMP `dc:subject`, or else IPTC Keywords: what Synology Photos treats as tags.
+    pub keywords: Vec<String>,
     pub camera: Option<String>,
     pub lens: Option<String>,
     pub date: Option<String>,
@@ -124,18 +128,18 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 // ---------------------------------------------------------------------------
 // JPEG segment scanning
 
-struct Segment {
-    marker: u8,
+pub(crate) struct Segment {
+    pub marker: u8,
     /// Offset of the 0xFF of the marker.
-    start: usize,
+    pub start: usize,
     /// Offset of the payload (after the 2 length bytes).
-    data: usize,
+    pub data: usize,
     /// Offset one past the end of the payload.
-    end: usize,
+    pub end: usize,
 }
 
 /// Scans the header segments of a JPEG (everything before the first SOS).
-fn scan_segments(buf: &[u8]) -> io::Result<(Vec<Segment>, usize)> {
+pub(crate) fn scan_segments(buf: &[u8]) -> io::Result<(Vec<Segment>, usize)> {
     if buf.len() < 4 || buf[0] != 0xFF || buf[1] != 0xD8 {
         return Err(invalid("not a JPEG file"));
     }
@@ -172,8 +176,8 @@ fn scan_segments(buf: &[u8]) -> io::Result<(Vec<Segment>, usize)> {
 }
 
 /// Reads only the header segments of a file (fast: does not read image data).
-/// Returns the payloads of the APP1 segments and the frame size.
-fn read_header(path: &Path) -> io::Result<(Vec<Vec<u8>>, Option<(u32, u32)>)> {
+/// Returns the payloads of the APP1 and APP13 segments and the frame size.
+fn read_header(path: &Path) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Option<(u32, u32)>)> {
     let mut f = io::BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
     let mut two = [0u8; 2];
     f.read_exact(&mut two)?;
@@ -181,6 +185,7 @@ fn read_header(path: &Path) -> io::Result<(Vec<Vec<u8>>, Option<(u32, u32)>)> {
         return Err(invalid("not a JPEG file"));
     }
     let mut out = Vec::new();
+    let mut app13 = Vec::new();
     let mut dims = None;
     loop {
         let mut b = [0u8; 1];
@@ -194,7 +199,7 @@ fn read_header(path: &Path) -> io::Result<(Vec<Vec<u8>>, Option<(u32, u32)>)> {
             marker = b[0];
         }
         if marker == 0xDA || marker == 0xD9 {
-            return Ok((out, dims));
+            return Ok((out, app13, dims));
         }
         f.read_exact(&mut two)?;
         let len = u16::from_be_bytes(two) as usize;
@@ -205,6 +210,10 @@ fn read_header(path: &Path) -> io::Result<(Vec<Vec<u8>>, Option<(u32, u32)>)> {
             let mut data = vec![0u8; len - 2];
             f.read_exact(&mut data)?;
             out.push(data);
+        } else if marker == 0xED {
+            let mut data = vec![0u8; len - 2];
+            f.read_exact(&mut data)?;
+            app13.push(data);
         } else if is_sof(marker) && len >= 7 {
             let mut data = [0u8; 5];
             f.read_exact(&mut data)?;
@@ -236,8 +245,12 @@ pub fn read_meta_from_file(path: &Path) -> io::Result<Meta> {
     if crate::heic::is_heic(path) {
         return crate::heic::read_meta(path);
     }
-    let (app1, dims) = read_header(path)?;
-    Ok(with_dims(parse_app1s(app1.iter().map(|v| v.as_slice())), dims))
+    let (app1, app13, dims) = read_header(path)?;
+    let mut meta = parse_app1s(app1.iter().map(|v| v.as_slice()));
+    if meta.keywords.is_empty() {
+        meta.keywords = keywords::read_iptc(app13.iter().map(|v| v.as_slice()));
+    }
+    Ok(with_dims(meta, dims))
 }
 
 /// Parses metadata from a complete in-memory JPEG.
@@ -249,7 +262,12 @@ pub fn read_meta_from_bytes(buf: &[u8]) -> Meta {
                 .find(|s| is_sof(s.marker))
                 .and_then(|s| sof_dims(&buf[s.data..s.end]));
             let app1s = segs.iter().filter(|s| s.marker == 0xE1).map(|s| &buf[s.data..s.end]);
-            with_dims(parse_app1s(app1s), dims)
+            let mut meta = parse_app1s(app1s);
+            if meta.keywords.is_empty() {
+                let app13 = segs.iter().filter(|s| s.marker == 0xED).map(|s| &buf[s.data..s.end]);
+                meta.keywords = keywords::read_iptc(app13);
+            }
+            with_dims(meta, dims)
         }
         Err(_) => Meta {
             orientation: 1,
@@ -271,7 +289,9 @@ pub(crate) fn parse_app1s<'a>(app1s: impl Iterator<Item = &'a [u8]>) -> Meta {
                 exif_rating = parse_exif(&t, &mut meta);
             }
         } else if let Some(xmp) = data.strip_prefix(XMP_HEADER) {
-            xmp_rating = xmp_find_rating(&String::from_utf8_lossy(xmp));
+            let xmp = String::from_utf8_lossy(xmp);
+            xmp_rating = xmp_find_rating(&xmp);
+            meta.keywords = keywords::read_xmp(&xmp).unwrap_or_default();
         }
     }
     // XMP is what Lightroom & co. treat as authoritative.
@@ -641,7 +661,7 @@ fn new_tiff_with_rating(rating: u8) -> Vec<u8> {
     w.d
 }
 
-fn push_segment(out: &mut Vec<u8>, marker: u8, header: &[u8], body: &[u8]) -> io::Result<()> {
+pub(crate) fn push_segment(out: &mut Vec<u8>, marker: u8, header: &[u8], body: &[u8]) -> io::Result<()> {
     let len = 2 + header.len() + body.len();
     if len > 0xFFFF {
         return Err(invalid("metadata segment would exceed 64 KB"));
@@ -739,20 +759,32 @@ pub fn write_rating(path: &Path, rating: u8) -> io::Result<()> {
         return Err(invalid("rating verification failed; file left unchanged"));
     }
 
+    replace_file(path, &new, Some(rating >= crate::app::PICKED_MIN))
+}
+
+/// Atomically replaces `path` with `new` (temp file + rename), keeping its
+/// timestamps, permissions and macOS extended attributes. `picked` sets or clears
+/// the "Picked" Finder tag; with `None` the file's tags are kept as they are.
+pub(crate) fn replace_file(path: &Path, new: &[u8], picked: Option<bool>) -> io::Result<()> {
     let md = fs::metadata(path)?;
     let mtime = filetime::FileTime::from_last_modification_time(&md);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("photo");
     let tmp = path.with_file_name(format!(".{name}.picker-tmp"));
     {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(&new)?;
+        f.write_all(new)?;
         f.sync_all()?;
     }
     #[cfg(target_os = "macos")]
-    if let Err(e) = crate::mac_tags::carry_over(path, &tmp, rating >= crate::app::PICKED_MIN) {
+    if let Err(e) = crate::mac_tags::carry_over(path, &tmp, picked) {
         let _ = fs::remove_file(&tmp);
         return Err(io::Error::new(e.kind(), format!("Finder tags: {e}")));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = picked;
+    // Best effort: network shares may refuse these.
+    let _ = fs::set_permissions(&tmp, md.permissions());
+    keep_created(&tmp, &md);
     let _ = filetime::set_file_mtime(&tmp, mtime);
     // On Windows, antivirus or Explorer's thumbnailer can briefly lock the file.
     let mut attempt = 0;
@@ -769,6 +801,20 @@ pub fn write_rating(path: &Path, rating: u8) -> io::Result<()> {
             }
         }
     }
+}
+
+/// A renamed temp file would otherwise count as newly created.
+fn keep_created(tmp: &Path, md: &fs::Metadata) {
+    #[cfg(target_os = "macos")]
+    use std::os::macos::fs::FileTimesExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileTimesExt;
+    #[cfg(any(target_os = "macos", windows))]
+    if let (Ok(created), Ok(f)) = (md.created(), fs::OpenOptions::new().write(true).open(tmp)) {
+        let _ = f.set_times(fs::FileTimes::new().set_created(created));
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = (tmp, md);
 }
 
 // ---------------------------------------------------------------------------
@@ -811,13 +857,13 @@ fn write_sidecar_rating(path: &Path, rating: u8) -> io::Result<()> {
     }
     // The Finder tag goes on the photo itself (an extended attribute, the file is unchanged).
     #[cfg(target_os = "macos")]
-    if let Err(e) = crate::mac_tags::carry_over(path, path, rating >= crate::app::PICKED_MIN) {
+    if let Err(e) = crate::mac_tags::carry_over(path, path, Some(rating >= crate::app::PICKED_MIN)) {
         return Err(io::Error::new(e.kind(), format!("Finder tags: {e}")));
     }
     Ok(())
 }
 
-fn invalid(msg: &str) -> io::Error {
+pub(crate) fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 

@@ -46,6 +46,8 @@ pub enum Msg {
     Image { key: Key, target: [u32; 2], epoch: u64, result: Result<TextureHandle, String> },
     /// `count` is how many queued rating commands this write covered.
     Written { generation: u64, idx: usize, rating: u8, count: u32, result: Result<(), String> },
+    /// `count` is how many queued keyword commands this write covered.
+    KeywordWritten { generation: u64, idx: usize, on: bool, count: u32, result: Result<(), String> },
     CopyProgress { done: usize, total: usize },
     CopyDone { copied: usize, skipped: usize, errors: Vec<String>, dest: PathBuf },
 }
@@ -274,6 +276,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 pub enum WriteCmd {
     Rate { generation: u64, idx: usize, path: PathBuf, rating: u8 },
+    Keyword { generation: u64, idx: usize, path: PathBuf, keyword: String, on: bool },
     /// Each file with an optional subfolder of `dest` (e.g. "2016-03").
     Copy { files: Vec<(PathBuf, Option<String>)>, dest: PathBuf },
 }
@@ -285,11 +288,16 @@ pub fn start_writer(ctx: egui::Context, tx: Sender<Msg>, rx: Receiver<WriteCmd>)
             while let Ok(first) = rx.recv() {
                 // Coalesce queued ratings: rapid key presses on one photo write once.
                 let mut rates: BTreeMap<PathBuf, (u64, usize, u8, u32)> = BTreeMap::new();
+                let mut keywords: BTreeMap<PathBuf, (u64, usize, String, bool, u32)> = BTreeMap::new();
                 let mut copies = Vec::new();
                 let mut push = |cmd| match cmd {
                     WriteCmd::Rate { generation, idx, path, rating } => {
                         let count = rates.get(&path).map_or(0, |r| r.3) + 1;
                         rates.insert(path, (generation, idx, rating, count));
+                    }
+                    WriteCmd::Keyword { generation, idx, path, keyword, on } => {
+                        let count = keywords.get(&path).map_or(0, |k| k.4) + 1;
+                        keywords.insert(path, (generation, idx, keyword, on, count));
                     }
                     WriteCmd::Copy { files, dest } => copies.push((files, dest)),
                 };
@@ -302,7 +310,12 @@ pub fn start_writer(ctx: egui::Context, tx: Sender<Msg>, rx: Receiver<WriteCmd>)
                     let _ = tx.send(Msg::Written { generation, idx, rating, count, result });
                     ctx.request_repaint();
                 }
-                // Copies run after all ratings queued before them are on disk.
+                for (path, (generation, idx, keyword, on, count)) in keywords {
+                    let result = crate::keywords::write_keyword(&path, &keyword, on).map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::KeywordWritten { generation, idx, on, count, result });
+                    ctx.request_repaint();
+                }
+                // Copies run after all ratings and keywords queued before them are on disk.
                 for (files, dest) in copies {
                     copy_files(&files, &dest, &ctx, &tx);
                 }
@@ -375,6 +388,41 @@ fn copy_files(files: &[(PathBuf, Option<String>)], dest: &Path, ctx: &egui::Cont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_keyword_toggles_reach_the_file_and_report_back() {
+        let dir = std::env::temp_dir().join(format!("picker-writer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (good, bad) = (dir.join("good.jpg"), dir.join("bad.jpg"));
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 1, 2, 3, 0xFF, 0xD9];
+        fs::write(&good, jpeg).unwrap();
+        fs::write(&bad, b"not a jpeg").unwrap();
+
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let cmd = |idx, path: &Path, on| WriteCmd::Keyword { generation: 7, idx, path: path.to_path_buf(), keyword: "pere".into(), on };
+        // Queued before the writer starts, so they arrive as one batch: on, off, on.
+        for on in [true, false, true] {
+            cmd_tx.send(cmd(0, &good, on)).unwrap();
+        }
+        cmd_tx.send(cmd(1, &bad, true)).unwrap();
+        drop(cmd_tx);
+        start_writer(egui::Context::default(), msg_tx, cmd_rx).join().unwrap();
+
+        let mut done: Vec<_> = msg_rx
+            .try_iter()
+            .filter_map(|m| match m {
+                Msg::KeywordWritten { generation: 7, idx, on, count, result } => Some((idx, on, count, result.is_ok())),
+                _ => None,
+            })
+            .collect();
+        done.sort();
+        assert_eq!(done, [(0, true, 3, true), (1, true, 1, false)]);
+        assert_eq!(meta::read_meta_from_file(&good).unwrap().keywords, ["pere"]);
+        assert_eq!(fs::read(&bad).unwrap(), b"not a jpeg");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn copy_keeps_same_named_photos_apart_and_brings_sidecars() {
