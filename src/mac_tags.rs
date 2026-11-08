@@ -9,9 +9,9 @@ pub const PICKED_TAG: &str = "Picked";
 const TAGS_ATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 
 /// Copies all extended attributes from `from` to `to`, adding or removing the
-/// "Picked" tag. Other tags the user set are kept. `from` and `to` may be the
-/// same file, to just update the tag.
-pub fn carry_over(from: &Path, to: &Path, picked: bool) -> io::Result<()> {
+/// "Picked" tag (`None` leaves all tags as they are). Other tags the user set
+/// are kept. `from` and `to` may be the same file, to just update the tag.
+pub fn carry_over(from: &Path, to: &Path, picked: Option<bool>) -> io::Result<()> {
     let in_place = from == to;
     for name in xattr::list(from)?.filter(|_| !in_place) {
         if name == TAGS_ATTR {
@@ -24,6 +24,12 @@ pub fn carry_over(from: &Path, to: &Path, picked: bool) -> io::Result<()> {
     }
 
     let old = xattr::get(from, TAGS_ATTR)?;
+    let Some(picked) = picked else {
+        return match &old {
+            Some(bytes) if !in_place => xattr::set(to, TAGS_ATTR, bytes),
+            _ => Ok(()),
+        };
+    };
     let mut tags = match &old {
         Some(bytes) => match parse_tags(bytes) {
             Some(t) => t,
@@ -83,26 +89,30 @@ mod tests {
         xattr::set(&a, TAGS_ATTR, &buf).unwrap();
         xattr::set(&a, "com.example.keep", b"1").unwrap();
 
-        carry_over(&a, &b, true).unwrap();
+        carry_over(&a, &b, Some(true)).unwrap();
         let tags = parse_tags(&xattr::get(&b, TAGS_ATTR).unwrap().unwrap()).unwrap();
         assert_eq!(tags, ["Red\n6", "Picked"]);
         assert_eq!(xattr::get(&b, "com.example.keep").unwrap().as_deref(), Some(&b"1"[..]));
 
-        carry_over(&b, &c, false).unwrap();
+        carry_over(&b, &c, Some(false)).unwrap();
         let tags = parse_tags(&xattr::get(&c, TAGS_ATTR).unwrap().unwrap()).unwrap();
         assert_eq!(tags, ["Red\n6"]);
 
         // In place: the tag is added and removed again on the same file.
-        carry_over(&c, &c, true).unwrap();
-        carry_over(&c, &c, false).unwrap();
+        carry_over(&c, &c, Some(true)).unwrap();
+        carry_over(&c, &c, Some(false)).unwrap();
         let tags = parse_tags(&xattr::get(&c, TAGS_ATTR).unwrap().unwrap()).unwrap();
         assert_eq!(tags, ["Red\n6"]);
         fs::write(&a, b"x").unwrap();
         let fresh = dir.join("d");
         fs::write(&fresh, b"x").unwrap();
-        carry_over(&fresh, &fresh, true).unwrap();
-        carry_over(&fresh, &fresh, false).unwrap();
+        carry_over(&fresh, &fresh, Some(true)).unwrap();
+        carry_over(&fresh, &fresh, Some(false)).unwrap();
         assert_eq!(xattr::get(&fresh, TAGS_ATTR).unwrap(), None);
+
+        // Without a "picked" decision the tags are carried over untouched.
+        carry_over(&c, &fresh, None).unwrap();
+        assert_eq!(xattr::get(&fresh, TAGS_ATTR).unwrap(), xattr::get(&c, TAGS_ATTR).unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

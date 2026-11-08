@@ -4,9 +4,11 @@
 mod app;
 mod decode;
 mod heic;
+mod keywords;
 #[cfg(target_os = "macos")]
 mod mac_tags;
 mod meta;
+mod settings;
 mod workers;
 
 use std::path::PathBuf;

@@ -10,7 +10,9 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Key as K, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, pos2, vec2,
 };
 
+use crate::keywords;
 use crate::meta::{self, CaptureTime, Meta};
+use crate::settings::Settings;
 use crate::workers::{self, Job, Key, Kind, Msg, Scheduler, WriteCmd};
 
 pub const PICK: u8 = 4;
@@ -80,11 +82,15 @@ struct Photo {
     name: String,
     /// `None` until the metadata pass has read it.
     rating: Option<u8>,
+    /// The family keyword is on this photo.
+    tagged: bool,
     meta: Option<Meta>,
     /// Capture time, from EXIF or the file's modification time. `None` until read.
     when: Option<CaptureTime>,
     /// Number of rating writes not yet confirmed.
     pending: u32,
+    /// Number of keyword writes not yet confirmed.
+    keyword_pending: u32,
     /// The last rating write failed, so the file doesn't have the shown rating.
     unsaved: bool,
     error: Option<String>,
@@ -141,6 +147,8 @@ pub struct PickerApp {
     last_request: Option<(u64, usize, [u32; 2], bool, usize, usize, usize)>,
 
     filter: Filter,
+    /// The family keyword (see [`Settings`]).
+    keyword: String,
     auto_advance: bool,
     show_info: bool,
     show_help: bool,
@@ -164,6 +172,7 @@ impl PickerApp {
         let sched = Scheduler::start(ctx.clone(), tx.clone());
         let (write_tx, write_rx) = mpsc::channel();
         let writer = workers::start_writer(ctx.clone(), tx.clone(), write_rx);
+        let (settings, settings_error) = Settings::load();
         let mut app = PickerApp {
             ctx,
             tx,
@@ -187,6 +196,7 @@ impl PickerApp {
             preview_target: [0, 0],
             last_request: None,
             filter: Filter::All,
+            keyword: settings.keyword,
             auto_advance: true,
             show_info: true,
             show_help: false,
@@ -198,6 +208,9 @@ impl PickerApp {
             snacks: Vec::new(),
             view_rect: Rect::NOTHING,
         };
+        if let Some(e) = settings_error {
+            app.show_error("settings", "Settings not used".to_string(), e);
+        }
         if let Some(p) = start {
             app.open(p);
         }
@@ -257,9 +270,11 @@ impl PickerApp {
                                 .into_owned(),
                             path,
                             rating: None,
+                            tagged: false,
                             meta: None,
                             when: None,
                             pending: 0,
+                            keyword_pending: 0,
                             unsaved: false,
                             error: None,
                         })
@@ -276,6 +291,7 @@ impl PickerApp {
                         if p.pending == 0 && p.rating.is_none() {
                             p.rating = Some(meta.rating.unwrap_or(0));
                         }
+                        p.tagged = keywords::contains(&meta.keywords, &self.keyword);
                         p.when = meta::capture_time(&meta);
                         p.meta = Some(meta);
                         self.meta_done += 1;
@@ -326,6 +342,24 @@ impl PickerApp {
                                 p.error = Some(format!("Failed to write ★{rating} to {}: {e}", p.name));
                                 let title = format!("Rating not saved: {}", p.name);
                                 self.show_error("write", title, e);
+                            }
+                        }
+                    }
+                }
+                Msg::KeywordWritten { generation, idx, on, count, result } if generation == self.generation => {
+                    if let Some(p) = self.photos.get_mut(idx) {
+                        p.keyword_pending = p.keyword_pending.saturating_sub(count);
+                        match result {
+                            Ok(()) => p.error = None,
+                            Err(e) => {
+                                // The file is unchanged, so the toggle goes back to match it.
+                                if p.keyword_pending == 0 {
+                                    p.tagged = !on;
+                                }
+                                let action = if on { "add" } else { "remove" };
+                                p.error = Some(format!("Failed to {action} “{}” on {}: {e}", self.keyword, p.name));
+                                let title = format!("Tag not saved: {}", p.name);
+                                self.show_error("keyword", title, e);
                             }
                         }
                     }
@@ -509,6 +543,28 @@ impl PickerApp {
         self.rate(if shortlisted { REJECT } else { SHORTLIST });
     }
 
+    /// T toggles the family keyword on the current photo. The photo stays
+    /// current, so it can be rated next.
+    fn toggle_keyword(&mut self) {
+        let (generation, idx) = (self.generation, self.cur);
+        let Some(p) = self.photos.get(idx) else { return };
+        if crate::heic::is_heic(&p.path) {
+            self.set_status("Keywords work on JPEG photos only for now");
+            return;
+        }
+        // Not read yet: the current state of the file isn't known.
+        if p.meta.is_none() {
+            return;
+        }
+        let p = &mut self.photos[idx];
+        p.tagged = !p.tagged;
+        p.keyword_pending += 1;
+        if let Some(tx) = &self.write_tx {
+            let cmd = WriteCmd::Keyword { generation, idx, path: p.path.clone(), keyword: self.keyword.clone(), on: p.tagged };
+            let _ = tx.send(cmd);
+        }
+    }
+
     /// Copies all picks (from every month), optionally into "YYYY-MM" subfolders.
     fn copy_picked(&mut self, by_month: bool) {
         let files: Vec<(PathBuf, Option<String>)> = self
@@ -565,6 +621,7 @@ impl PickerApp {
                 K::P => self.toggle_pick(),
                 K::S => self.toggle_shortlist(),
                 K::X | K::U => self.rate(REJECT),
+                K::T => self.toggle_keyword(),
                 K::Num0 => self.rate(0),
                 K::Num1 => self.rate(1),
                 K::Num2 => self.rate(2),
@@ -719,6 +776,11 @@ impl PickerApp {
                 }
             }
             divider(ui);
+            let tagged = self.photos.get(self.cur).is_some_and(|p| p.tagged);
+            let hint = format!("Add or remove the “{}” keyword on this photo (T)", self.keyword);
+            if ui.selectable_label(tagged, self.keyword.as_str()).on_hover_text(hint).clicked() {
+                self.toggle_keyword();
+            }
             if ui
                 .selectable_label(self.auto_advance, "Auto-advance")
                 .on_hover_text("Go to the next photo after rating (A)")
@@ -731,7 +793,7 @@ impl PickerApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let pending: u32 = self.photos.iter().map(|p| p.pending).sum();
+                let pending: u32 = self.photos.iter().map(|p| p.pending + p.keyword_pending).sum();
                 let unsaved = self.photos.iter().filter(|p| p.unsaved).count();
                 if unsaved > 0 {
                     let first = self.photos.iter().find(|p| p.unsaved).and_then(|p| p.error.clone()).unwrap_or_default();
@@ -861,6 +923,10 @@ impl PickerApp {
                 FontId::proportional(9.0),
                 if is_cur { BRIGHT } else { rating_color(rating).gamma_multiply(0.8) },
             );
+            if self.photos[idx].tagged {
+                painter.circle_filled(shown_rect.right_top() + vec2(-8.0, 8.0), 4.0, BRIGHT);
+                painter.circle_stroke(shown_rect.right_top() + vec2(-8.0, 8.0), 4.0, Stroke::new(1.0, CANVAS));
+            }
             if is_cur {
                 painter.rect_stroke(shown_rect, 1.0, Stroke::new(1.5, BRIGHT), egui::StrokeKind::Outside);
             }
@@ -994,7 +1060,14 @@ impl PickerApp {
         let galley = painter.layout_no_wrap(badge, FontId::proportional(15.0), rating_color(rating));
         let bpos = rect.left_top() + vec2(20.0, 18.0);
         painter.rect_filled(Rect::from_min_size(bpos - vec2(10.0, 6.0), galley.size() + vec2(20.0, 12.0)), 4.0, Color32::from_black_alpha(150));
+        let tag_pos = bpos + vec2(0.0, galley.size().y + 20.0);
         painter.galley(bpos, galley, Color32::WHITE);
+
+        if p.tagged {
+            let galley = painter.layout_no_wrap(self.keyword.clone(), FontId::proportional(15.0), BRIGHT);
+            painter.rect_filled(Rect::from_min_size(tag_pos - vec2(10.0, 6.0), galley.size() + vec2(20.0, 12.0)), 4.0, Color32::from_black_alpha(150));
+            painter.galley(tag_pos, galley, Color32::WHITE);
+        }
 
         if self.show_info {
             let vis = self.visible_indices();
@@ -1025,6 +1098,9 @@ impl PickerApp {
             }
             if p.pending > 0 {
                 lines.push("saving rating…".into());
+            }
+            if p.keyword_pending > 0 {
+                lines.push("saving tag…".into());
             }
             if let Some(e) = &p.error {
                 lines.push(e.clone());
@@ -1112,6 +1188,7 @@ impl PickerApp {
 
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_help;
+        let tag_help = format!("Add or remove the “{}” keyword (JPEG)", self.keyword);
         egui::Window::new("Keyboard shortcuts")
             .open(&mut open)
             .collapsible(false)
@@ -1125,6 +1202,7 @@ impl PickerApp {
                         ("X  or  U", "Unpick / reject → ★ (1 star)"),
                         ("1 … 5", "Set 1–5 stars"),
                         ("0", "Clear rating"),
+                        ("T", tag_help.as_str()),
                         ("→  ↓  Space", "Next photo"),
                         ("←  ↑  Backspace", "Previous photo"),
                         ("PgUp / PgDn", "Jump 10"),
@@ -1144,7 +1222,7 @@ impl PickerApp {
                     }
                 });
                 ui.add_space(12.0);
-                ui.small("Ratings are written to the JPEG immediately (EXIF Rating + XMP xmp:Rating),\nso Lightroom, Bridge, Windows Explorer and others see them.\nHEIC photos are never changed: their rating goes to a small IMG_1234.HEIC.xmp file next to them.\nOn macOS, picked photos also get a \"Picked\" Finder tag.");
+                ui.small("Ratings are written to the JPEG immediately (EXIF Rating + XMP xmp:Rating),\nso Lightroom, Bridge, Windows Explorer and others see them.\nHEIC photos are never changed: their rating goes to a small IMG_1234.HEIC.xmp file next to them.\nOn macOS, picked photos also get a \"Picked\" Finder tag.\nThe T keyword goes into XMP dc:subject and IPTC Keywords, which Synology Photos reads as tags.");
             });
         self.show_help = open;
     }

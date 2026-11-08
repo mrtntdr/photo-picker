@@ -46,6 +46,7 @@ The `.ico` is made from `assets/icon.png` by `scripts/make-ico.ps1`.
 | **X** / **U** | Unpick / reject → 1 star |
 | **1 … 5** | Set 1–5 stars |
 | **0** | Clear rating |
+| **T** | Add or remove the family keyword (default "pere", JPEG only) |
 | → ↓ Space / ← ↑ Backspace | Next / previous |
 | PgDn / PgUp, Home / End | Jump 10, first / last |
 | **Z**, Enter, click | 100% zoom where you clicked (drag to pan) |
@@ -62,6 +63,21 @@ all months, whatever month is selected), either into that one folder or into mon
 modification time. A file that is already at the destination (same name, size and modification
 time) is skipped; a different photo with the same name, as iPhones reuse `IMG_1234`, is copied as
 `IMG_1234_1.HEIC`.
+
+## Keywords (sharing with Synology Photos)
+
+**T** adds a keyword to the current JPEG, or removes it if it's already there; it doesn't move on to
+the next photo, so you can still rate it. Photos with the keyword show a badge and a dot in the filmstrip. Synology
+Photos reads it as a tag, so a conditional album filtered on that tag fills up by itself.
+
+The keyword is `pere` unless changed in the settings file, which is created on first run. Restart
+the app after editing it. It may be up to 64 bytes (õ, ä, ö, ü take two).
+
+* macOS: `~/Library/Application Support/Photo Picker/settings.txt`
+* Windows: `%APPDATA%\Photo Picker\settings.txt`
+
+Keywords are read from the file on load (XMP first, then IPTC, as Synology does). Matching ignores
+case and Unicode form, so `Pere` is not duplicated. HEIC and RAF files aren't supported.
 
 ## HEIC (iPhone photos)
 
@@ -86,12 +102,20 @@ For JPEG:
   drops. Other Finder tags and extended attributes on the file are kept. Search for it in Finder
   or Spotlight with `tag:Picked`.
 
+The keyword goes to XMP `dc:subject` and IPTC `Keywords` (2:25). Other keywords keep their order.
+XMP wins in Synology, so when one of the two doesn't exist yet it starts with the other's keywords.
+IPTC is marked as UTF-8 (1:90): text already there in another encoding is converted first, and a
+stored IPTC digest is updated. The photo is refused with an error, and left unchanged, if it uses
+something this can't edit safely: an unsupported `dc:subject` form, a non-UTF-8 IPTC character set,
+or metadata after an MPF (multi-picture) segment, which would break the offsets stored there.
+
 Safety:
 * Only the metadata segments change. The compressed image data is copied byte for byte.
 * Existing EXIF data (including maker notes) is never moved.
 * Each write goes to a temp file first, is re-read to verify, and then atomically replaces the
   original.
-* The file's modification time is preserved.
+* The file's modification and creation times and its permissions are preserved.
+* Keyword writes also compare every other segment and all other keywords before replacing the file.
 
 ## Performance notes
 
@@ -110,4 +134,6 @@ Safety:
 
 Tests: `cargo test`. To run the rating roundtrip and a decode benchmark against real files
 (**use copies — this rewrites ratings**):
-`PICKER_TEST_DIR=/path/to/copies cargo test --release -- --ignored --nocapture`
+`PICKER_TEST_DIR=/path/to/copies cargo test --release -- --ignored --nocapture`.
+This also runs a keyword roundtrip compared against `exiftool`, which the tests use when it's
+installed (`brew install exiftool`). **It leaves the keyword on the copies.**
